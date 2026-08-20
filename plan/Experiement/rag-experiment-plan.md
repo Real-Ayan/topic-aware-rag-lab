@@ -15,8 +15,8 @@
 3. [Dependencies](#3-dependencies)
 4. [Configuration](#4-configuration)
 5. [Shared utilities](#5-shared-utilities)
-6. [Pipeline A — Contextual RAG](#6-pipeline-a--contextual-rag)
-7. [Pipeline B — Topic Modeling RAG](#7-pipeline-b--topic-modeling-rag)
+6. [pipeline_contextual_rag](#6-pipeline-a--contextual-rag)
+7. [pipeline_topic_modeling_rag](#7-pipeline-b--topic-modeling-rag)
    - 7a. Load + big chunks
    - 7b. Embed big chunks
    - 7c. BERTopic topic discovery
@@ -70,18 +70,18 @@ rag-experiment/
 │   ├── chroma_store.py       ← Chroma add / similarity_search wrapper
 │   ├── contextualizer.py     ← LLM context prefix per chunk
 │   │
-│   ├── pipeline_a.py         ← Pipeline A: contextual RAG end-to-end
+│   ├── pipeline_contextual_rag.py         ← pipeline_contextual_rag: contextual RAG end-to-end
 │   │
-│   └── pipeline_b/
+│   └── pipeline_topic_modeling_rag/
 │       ├── __init__.py
-│       ├── pipeline_b.py     ← Pipeline B orchestrator
+│       ├── pipeline_topic_modeling_rag.py     ← pipeline_topic_modeling_rag orchestrator
 │       ├── topic_discovery.py  ← BERTopic: embed chunks → topics
 │       ├── topic_tagger.py     ← assign topic_slug to each chunk
 │       └── topic_doc_builder.py ← iterative LLM topic document creation
 │
 ├── scripts/
-│   ├── run_pipeline_a.py     ← entry: load data → run A → dump artifacts
-│   ├── run_pipeline_b.py     ← entry: load data → run B → dump artifacts
+│   ├── run_pipeline_contextual_rag.py     ← entry: load data → run contextual → dump artifacts
+│   ├── run_pipeline_topic_modeling_rag.py     ← entry: load data → run topic-modeling → dump artifacts
 │   ├── generate_testset.py   ← RAGAS TestsetGenerator → candidate qa_pairs
 │   └── run_evaluation.py     ← query both pipelines → RAGAS → results
 │
@@ -135,8 +135,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # OpenAI
     OPENAI_API_KEY: str
-    LLM_MODEL: str = "gpt-4o-mini"          # used for context prefix + topic doc building
-    EMBEDDING_MODEL: str = "text-embedding-3-small"  # 1536 dims
+    LLM_MODEL: str = "gpt-5.6-terra"        # used for context prefix + topic doc building
+    EMBEDDING_MODEL: str = "text-embedding-3-large"  # 3072 dims
 
     # Chunking
     BIG_CHUNK_SIZE: int = 800               # tokens, for raw source chunks
@@ -226,9 +226,9 @@ Returns the context string. Call this per-chunk. To save cost, you can skip chun
 
 ---
 
-## 6. Pipeline A — Contextual RAG
+## 6. pipeline_contextual_rag
 
-`src/pipeline_a.py`
+`src/pipeline_contextual_rag.py`
 
 ```
 Load raw files
@@ -256,15 +256,15 @@ At query time (`scripts/run_evaluation.py`), embed the query → `chroma_store.s
 
 ---
 
-## 7. Pipeline B — Topic Modeling RAG
+## 7. pipeline_topic_modeling_rag
 
-`src/pipeline_b/pipeline_b.py` orchestrates the steps below.
+`src/pipeline_topic_modeling_rag/pipeline_topic_modeling_rag.py` orchestrates the steps below.
 
 ---
 
 ### 7a. Load + big chunks
 
-Identical to Pipeline A steps 1–2. Use the **same chunk size settings** so the comparison is fair.
+Identical to pipeline_contextual_rag steps 1–2. Use the **same chunk size settings** so the comparison is fair.
 
 Dump to `artifacts/topic_modeling/big_chunks.jsonl`.
 
@@ -280,7 +280,7 @@ These embeddings are used only for BERTopic clustering — not for retrieval.
 
 ### 7c. BERTopic topic discovery
 
-`src/pipeline_b/topic_discovery.py`
+`src/pipeline_topic_modeling_rag/topic_discovery.py`
 
 ```python
 from bertopic import BERTopic
@@ -322,7 +322,7 @@ Then give a human-readable label (3-5 words).
 Reply in JSON: {"slug": "...", "label": "..."}
 ```
 
-**Outliers:** BERTopic assigns `-1` to chunks that don't fit any cluster. These are labeled `topic_slug = "uncategorized"` and excluded from Pipeline B's topic docs (accepted data loss).
+**Outliers:** BERTopic assigns `-1` to chunks that don't fit any cluster. These are labeled `topic_slug = "uncategorized"` and excluded from pipeline_topic_modeling_rag's topic docs (accepted data loss).
 
 Save `artifacts/topic_modeling/discovered_topics.json`:
 
@@ -357,7 +357,7 @@ Also save the BERTopic model: `topic_model.save("artifacts/topic_modeling/bertop
 
 ### 7d. Tag source chunks
 
-`src/pipeline_b/topic_tagger.py`
+`src/pipeline_topic_modeling_rag/topic_tagger.py`
 
 Map each chunk index to its assigned `topic_slug` from the BERTopic output.
 
@@ -374,7 +374,7 @@ Save `artifacts/topic_modeling/topic_tags.jsonl` — one line per chunk:
 
 ### 7e. Iterative LLM topic document building
 
-`src/pipeline_b/topic_doc_builder.py`
+`src/pipeline_topic_modeling_rag/topic_doc_builder.py`
 
 For each non-`uncategorized` topic:
 
@@ -523,11 +523,11 @@ For each question in `qa_pairs.json`:
 ```
 query_embedding = embedder.embed([question])[0]
 
-# Pipeline A
+# pipeline_contextual_rag
 ctx_a = chroma_store.search(COLLECTION_CONTEXTUAL, query_embedding, TOP_K)
 answer_a = llm.ask(question, contexts=ctx_a)
 
-# Pipeline B
+# pipeline_topic_modeling_rag
 ctx_b = chroma_store.search(COLLECTION_TOPIC, query_embedding, TOP_K)
 answer_b = llm.ask(question, contexts=ctx_b)
 ```
@@ -563,23 +563,23 @@ dataset_a = Dataset.from_dict({
 result_a = evaluate(dataset_a, metrics=[faithfulness, answer_relevancy, context_precision, context_recall])
 ```
 
-Repeat for Pipeline B.
+Repeat for pipeline_topic_modeling_rag.
 
 ### Step 3 — Compare and save
 
 ```python
 import json
 results = {
-    "pipeline_a": result_a.to_pandas().to_dict(),
-    "pipeline_b": result_b.to_pandas().to_dict(),
+    "pipeline_contextual_rag": result_a.to_pandas().to_dict(),
+    "pipeline_topic_modeling_rag": result_b.to_pandas().to_dict(),
     "summary": {
-        "pipeline_a": {
+        "pipeline_contextual_rag": {
             "faithfulness": result_a["faithfulness"],
             "answer_relevancy": result_a["answer_relevancy"],
             "context_precision": result_a["context_precision"],
             "context_recall": result_a["context_recall"],
         },
-        "pipeline_b": { ... }
+        "pipeline_topic_modeling_rag": { ... }
     }
 }
 with open("artifacts/results.json", "w") as f:
@@ -599,7 +599,7 @@ with open("artifacts/results.json", "w") as f:
 
 ## 10. Coverage metric (custom)
 
-At the end of Pipeline B, calculate:
+At the end of pipeline_topic_modeling_rag, calculate:
 
 ```python
 total_chunks    = len(big_chunks)
@@ -611,7 +611,7 @@ print(f"Coverage: {coverage_pct:.1f}% ({covered}/{total_chunks} chunks in topic 
 print(f"Accepted data loss: {uncategorized} chunks ({100 - coverage_pct:.1f}%)")
 ```
 
-Add this to `artifacts/results.json` under `"pipeline_b_coverage"`.
+Add this to `artifacts/results.json` under `"pipeline_topic_modeling_rag_coverage"`.
 
 ---
 
@@ -619,8 +619,8 @@ Add this to `artifacts/results.json` under `"pipeline_b_coverage"`.
 
 | File | When written | What to check |
 |---|---|---|
-| `artifacts/contextual/chunks.jsonl` | After Pipeline A | Chunk sizes, context prefix quality |
-| `artifacts/topic_modeling/big_chunks.jsonl` | Step 7a | Same chunking as Pipeline A |
+| `artifacts/contextual/chunks.jsonl` | After pipeline_contextual_rag | Chunk sizes, context prefix quality |
+| `artifacts/topic_modeling/big_chunks.jsonl` | Step 7a | Same chunking as pipeline_contextual_rag |
 | `artifacts/topic_modeling/discovered_topics.json` | Step 7c | Topic labels, slug quality, outlier count |
 | `artifacts/topic_modeling/topic_tags.jsonl` | Step 7d | Are chunks tagged to the right topic? |
 | `artifacts/topic_modeling/topic_docs/*.md` | Step 7e | Coherence, hallucination spot-check |
@@ -635,11 +635,11 @@ Add this to `artifacts/results.json` under `"pipeline_b_coverage"`.
 ```
 1. Drop your files into data/raw/
 
-2. uv run scripts/run_pipeline_a.py
+2. uv run scripts/run_pipeline_contextual_rag.py
    → artifacts/contextual/chunks.jsonl
    → Chroma: contextual_rag populated
 
-3. uv run scripts/run_pipeline_b.py
+3. uv run scripts/run_pipeline_topic_modeling_rag.py
    → artifacts/topic_modeling/ fully populated
    → Chroma: topic_rag populated
    → EYEBALL: discovered_topics.json, topic_tags.jsonl, topic_docs/*.md
@@ -666,7 +666,7 @@ Open `topic_tags.jsonl`. For each unique `topic_slug`, read a few of its assigne
 Spot-check: pick a claim in a topic doc → find which chunks fed that topic via `_index.json` → search `big_chunks.jsonl` for those chunk IDs → verify the claim appears in the source chunk text. If it doesn't appear anywhere, that's a hallucination.
 
 **What is the output quality?**  
-`artifacts/results.json` → summary section → compare RAGAS scores across pipelines. A higher `context_recall` in Pipeline B means it retrieved more of what was needed. A higher `faithfulness` means less hallucination in final answers.
+`artifacts/results.json` → summary section → compare RAGAS scores across pipelines. A higher `context_recall` in pipeline_topic_modeling_rag means it retrieved more of what was needed. A higher `faithfulness` means less hallucination in final answers.
 
 ---
 
@@ -674,7 +674,7 @@ Spot-check: pick a claim in a topic doc → find which chunks fed that topic via
 
 | Decision | Trade-off accepted |
 |---|---|
-| Outlier chunks excluded from Pipeline B | Some source data is not represented in retrieval. Coverage metric quantifies this. |
+| Outlier chunks excluded from pipeline_topic_modeling_rag | Some source data is not represented in retrieval. Coverage metric quantifies this. |
 | Iterative LLM doc building | 1 LLM call per batch of 5 chunks per topic. Can be expensive on large corpora. Tune batch size. |
 | Single topic per chunk (hard assignment) | BERTopic can do soft multi-label but hard assignment keeps tagging simple for the POC. |
 | No BM25 / hybrid search | Both pipelines use dense-only retrieval. Adding BM25 would help keyword-heavy queries but adds complexity. Defer. |

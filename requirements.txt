@@ -6,7 +6,10 @@ hdbscan
 langchain
 langchain-openai
 langchain-community
+langchain-text-splitters
 pymupdf
+python-docx
+tiktoken
 ragas
 datasets
 python-dotenv

@@ -222,3 +222,15 @@ __marimo__/
 .env
 .env.*
 !.env.example
+
+# Experiment runtime
+artifacts/
+chroma_db/
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/README.md
+
+# Named knowledge bases (Chroma + manifests)
+knowledge_bases/
+
+runs/

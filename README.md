@@ -1,111 +1,84 @@
 # topic-aware-rag-lab
 
-Standalone experiment lab for topic-aware RAG. First study compares **contextual RAG** (Pipeline A) against **BERTopic topic-modeling RAG** (Pipeline B) on company PDFs and text, scored with RAGAS.
+Standalone experiment lab comparing **pipeline_contextual_rag** vs **pipeline_topic_modeling_rag**.
 
-| | |
-|---|---|
-| **LLM / embeddings** | OpenAI only (`gpt-4o-mini`, `text-embedding-3-small`) |
-| **Vector store** | Chroma (local, disk-persisted) |
-| **Topic discovery** | BERTopic with pre-computed OpenAI embeddings (`embedding_model=None`) |
-| **Eval** | RAGAS + custom topic coverage metric |
-
-Full blueprint: [`plan/Experiement/rag-experiment-plan.md`](plan/Experiement/rag-experiment-plan.md)  
-Concept notes: [`plan/Experiement/rag-concept-research-topic-modeling-rag.md`](plan/Experiement/rag-concept-research-topic-modeling-rag.md)
+Each execution creates a **run** under `runs/{run_id}/` with its own artifacts, knowledge bases, and `run_metadata.json` (models + estimated token usage).
 
 ---
 
-## What we compare
+## Put your files here
 
-**Pipeline A — Contextual RAG**  
-Load → chunk → LLM context prefix per chunk → embed → Chroma (`contextual_rag`).
-
-**Pipeline B — Topic Modeling RAG**  
-Load → big chunks → embed → BERTopic topics → tag chunks → iterative LLM topic docs → re-chunk / contextualize → embed → Chroma (`topic_rag`). Outlier chunks (`-1`) become `uncategorized` and are excluded from topic docs (tracked via coverage %).
-
-Both pipelines are queried with the same human-verified `qa_pairs.json` and scored with faithfulness, answer relevancy, context precision, and context recall.
+```
+data/raw/   # recursive: all nested .pdf / .docx / .txt
+```
 
 ---
 
 ## Setup
 
-Requires Python ≥ 3.12 and [uv](https://docs.astral.sh/uv/).
-
-Install **CPU Torch first**, then the rest. BERTopic pulls `sentence-transformers` → `torch`; without the CPU index, uv downloads large NVIDIA/CUDA wheels. This project uses OpenAI embeddings only, so GPU Torch is unnecessary.
-
 ```bash
-uv venv
-source .venv/bin/activate
-
-# 1. CPU Torch (do this first)
-uv add torch --index https://download.pytorch.org/whl/cpu
-
-# 2. Project deps
-uv add -r requirements.txt
-```
-
-If Torch was already resolved with CUDA packages, recreate the env:
-
-```bash
-rm -rf .venv
-uv venv
-source .venv/bin/activate
+uv venv && source .venv/bin/activate
 uv add torch --index https://download.pytorch.org/whl/cpu
 uv add -r requirements.txt
-```
-
-Copy env template and set your key:
-
-```bash
-cp .env.example .env   # create when available
-# OPENAI_API_KEY=sk-...
+cp .env.example .env   # set OPENAI_API_KEY
 ```
 
 ---
 
-## Planned layout
-
-```
-topic-aware-rag-lab/
-├── pyproject.toml / requirements.txt
-├── .env                          # gitignored
-├── data/raw/                     # drop PDFs and .txt files here
-├── qa_pairs.json                 # human-verified ground truth
-├── src/
-│   ├── config.py
-│   ├── loader.py / chunker.py / embedder.py / chroma_store.py / contextualizer.py
-│   ├── pipeline_a.py
-│   └── pipeline_b/               # discovery, tagging, topic doc builder
-├── scripts/
-│   ├── run_pipeline_a.py
-│   ├── run_pipeline_b.py
-│   ├── generate_testset.py
-│   └── run_evaluation.py
-├── artifacts/                    # gitignored, written at runtime
-└── plan/Experiement/             # design docs
-```
-
----
-
-## Run order (once code exists)
+## Run order
 
 ```bash
-# 1. Put PDFs / .txt into data/raw/
+uv run scripts/run_pipeline_contextual_rag.py
+uv run scripts/run_pipeline_topic_modeling_rag.py
 
-# 2. Contextual RAG
-uv run scripts/run_pipeline_a.py
+# Re-cluster without re-embedding (after changing cluster settings in .env)
+uv run scripts/run_topic_clustering.py --run-id <RUN_ID> --reuse-embeddings
 
-# 3. Topic modeling RAG — then eyeball topics / tags / topic docs
-uv run scripts/run_pipeline_b.py
-
-# 4. Candidate Q&A → human review → qa_pairs.json
 uv run scripts/generate_testset.py
-
-# 5. RAGAS comparison → artifacts/results.json
-uv run scripts/run_evaluation.py
+uv run scripts/run_evaluation.py --run-id <RUN_ID>
 ```
 
 ---
 
-## Status
+## Run IDs, metadata & tokens
 
-Scaffolding + experiment plan. Implementation of `src/` and `scripts/` is next.
+Run ids are **local timestamps**: `YYYYMMDD_HHMMSS` (e.g. `20260820_171521`). Newest sorts last alphabetically / first in the list.
+
+```bash
+uv run scripts/list_runs.py   # marks ← latest
+cat runs/latest.json          # pointer to last run
+cat runs/index.json           # all runs
+```
+
+Each run also has `runs/{run_id}/run_metadata.json` with `model_config` + API `token_usage`.
+
+---
+
+## Knowledge bases
+
+| Base name | On disk |
+|---|---|
+| `kb_contextual_rag` | `runs/{run_id}/knowledge_bases/kb_contextual_rag__{run_id}/` |
+| `kb_topic_modeling_rag` | `runs/{run_id}/knowledge_bases/kb_topic_modeling_rag__{run_id}/` |
+
+```bash
+uv run scripts/query_knowledge_base.py list
+uv run scripts/query_knowledge_base.py compare --run-id <RUN_ID> --question "..."
+```
+
+---
+
+## Clustering — general ideas (not corpus-specific)
+
+Defaults follow common BERTopic practice (`hdbscan` + `eom`). Treat `.env` as knobs you change, then re-cluster with cached embeddings.
+
+| Goal | What to try |
+|---|---|
+| Fewer / broader topics | Raise `HDBSCAN_MIN_CLUSTER_SIZE`; keep `HDBSCAN_SELECTION_METHOD=eom` |
+| More / finer topics | Lower `HDBSCAN_MIN_CLUSTER_SIZE`; try `HDBSCAN_SELECTION_METHOD=leaf` |
+| Fixed topic count | `CLUSTER_METHOD=kmeans` and set `N_TOPICS` to your target |
+| Stable geometry | Adjust `UMAP_N_NEIGHBORS` / `UMAP_N_COMPONENTS` (larger neighbors → smoother) |
+| Better topic names | Raise `TOPIC_LABEL_SAMPLES` (LLM sees more excerpts; no c-TF-IDF labels) |
+| Cheap iteration | Embed once → change knobs → `run_topic_clustering.py --reuse-embeddings` |
+
+Topic labels always come from **random chunk samples → LLM**, not keyword lists.
