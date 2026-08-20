@@ -10,7 +10,9 @@ from src.config import settings
 
 class ChromaStore:
     def __init__(self, path: str | None = None) -> None:
-        self.client = chromadb.PersistentClient(path=path or settings.CHROMA_PATH)
+        if path is None:
+            raise ValueError("ChromaStore requires an explicit persistence path")
+        self.client = chromadb.PersistentClient(path=path)
 
     def get_or_create(self, name: str) -> Collection:
         return self.client.get_or_create_collection(name=name)
@@ -53,23 +55,34 @@ class ChromaStore:
         collection_name: str,
         query_embedding: list[float],
         top_k: int | None = None,
+        *,
+        where: dict | None = None,
+        include_embeddings: bool = False,
     ) -> list[dict]:
         collection = self.client.get_collection(collection_name)
-        result = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k or settings.TOP_K,
-            include=["documents", "metadatas", "distances"],
-        )
+        include = ["documents", "metadatas", "distances"]
+        if include_embeddings:
+            include.append("embeddings")
+        kwargs: dict = {
+            "query_embeddings": [query_embedding],
+            "n_results": top_k or settings.TOP_K,
+            "include": include,
+        }
+        if where:
+            kwargs["where"] = where
+        result = collection.query(**kwargs)
         docs = result.get("documents", [[]])[0] or []
         metas = result.get("metadatas", [[]])[0] or []
         dists = result.get("distances", [[]])[0] or []
+        embs = (result.get("embeddings", [[]]) or [[]])[0] if include_embeddings else None
         out: list[dict] = []
-        for content, metadata, distance in zip(docs, metas, dists):
-            out.append(
-                {
-                    "content": content,
-                    "metadata": metadata or {},
-                    "distance": distance,
-                }
-            )
+        for i, (content, metadata, distance) in enumerate(zip(docs, metas, dists)):
+            item = {
+                "content": content,
+                "metadata": metadata or {},
+                "distance": distance,
+            }
+            if embs is not None and i < len(embs):
+                item["embedding"] = embs[i]
+            out.append(item)
         return out

@@ -1,4 +1,4 @@
-"""pipeline_topic_modeling_rag — Topic Modeling RAG orchestrator (run-scoped)."""
+"""pipeline_topic_modeling_rag — Topic tags + original chunks (no rewrite KB)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from rich.console import Console
 
 from src.chunker import chunk_records
 from src.config import settings
-from src.contextualizer import Contextualizer
 from src.embedder import Embedder
 from src.io_utils import ensure_dir, read_jsonl, write_json, write_jsonl
 from src.knowledge_base import kb_store, write_kb_manifest
@@ -63,12 +62,80 @@ def _prepare_chunks_and_embeddings(
     write_jsonl(chunks_path, big_chunks)
     console.print(f"  {len(big_chunks)} big chunks")
 
-    console.print("[cyan]2. Embed big chunks (for clustering only)...[/cyan]")
+    console.print("[cyan]2. Embed big chunks (clustering + KB)...[/cyan]")
     embedder = Embedder()
     cluster_embeddings = embedder.embed([c["content"] for c in big_chunks])
     save_embeddings_cache(out_root, big_chunks, cluster_embeddings)
     console.print(f"[green]Cached embeddings →[/green] {out_root / 'embeddings.npy'}")
     return big_chunks, np.asarray(cluster_embeddings, dtype=np.float32)
+
+
+def _store_tagged_originals(
+    *,
+    run,
+    big_chunks: list[dict],
+    emb: np.ndarray,
+    tags: list[dict],
+    out_root: Path,
+) -> tuple[str, dict]:
+    """
+    Index original source chunks with topic metadata.
+    Does NOT rewrite into topic docs for retrieval (names stay intact).
+    """
+    tag_by_id = {t["chunk_id"]: t for t in tags}
+    kb_base = settings.KB_TOPIC_MODELING
+    console.print(
+        f"[cyan]5. Storing topic-tagged ORIGINAL chunks →[/cyan] {run.kb_name(kb_base)}"
+    )
+
+    enriched: list[dict] = []
+    for i, chunk in enumerate(big_chunks):
+        tag = tag_by_id.get(chunk["chunk_id"], {})
+        enriched.append(
+            {
+                **chunk,
+                "topic_slug": tag.get("topic_slug", "uncategorized"),
+                "topic_id": int(tag.get("topic_id", -1)),
+                "topic_probability": float(tag.get("probability", 0.0)),
+            }
+        )
+
+    store, collection = kb_store(kb_base)
+    store.add(
+        collection,
+        ids=[c["chunk_id"] for c in enriched],
+        documents=[c["content"] for c in enriched],
+        embeddings=emb.tolist(),
+        metadatas=[
+            {
+                "chunk_id": c["chunk_id"],
+                "source": c["source"],
+                "page": int(c["page"]),
+                "topic_slug": c["topic_slug"],
+                "topic_id": int(c["topic_id"]),
+                "knowledge_base": collection,
+                "run_id": run.run_id,
+                "index_mode": "topic_tagged_originals",
+            }
+            for c in enriched
+        ],
+        reset=True,
+    )
+    write_jsonl(out_root / "final_chunks.jsonl", enriched)
+
+    total = len(big_chunks)
+    uncategorized = sum(1 for c in enriched if c["topic_slug"] == "uncategorized")
+    covered = total - uncategorized
+    coverage = {
+        "total_chunks": total,
+        "uncategorized": uncategorized,
+        "covered": covered,
+        "coverage_pct": round((covered / total * 100) if total else 0.0, 2),
+        "index_mode": "topic_tagged_originals",
+        "note": "All chunks including uncategorized are stored for retrieval.",
+    }
+    write_json(out_root / "coverage.json", coverage)
+    return collection, coverage
 
 
 def run_clustering_only(
@@ -77,10 +144,11 @@ def run_clustering_only(
     reuse_embeddings: bool = True,
     raw_dir: str | Path | None = None,
     build_topic_docs: bool = False,
+    rebuild_kb: bool = False,
 ) -> dict:
     """
     Re-run clustering + LLM sample labeling.
-    Default: reuse cached embeddings from the run (skip embed API cost).
+    Optionally rebuild the topic KB from tagged originals.
     """
     if run_id:
         run = load_run(run_id)
@@ -88,7 +156,7 @@ def run_clustering_only(
     else:
         run = start_run("topic_clustering_only")
     console.rule("[bold]topic clustering[/bold]")
-    console.print(f"[bold cyan]run_id:[/bold cyan] {run.run_id}  ← timestamp id (see runs/latest.json)")
+    console.print(f"[bold cyan]run_id:[/bold cyan] {run.run_id}")
     out_root = run.artifacts_dir / "topic_modeling"
     ensure_dir(out_root)
 
@@ -110,17 +178,36 @@ def run_clustering_only(
         result: dict = {"catalog": catalog, "tags": tags}
 
         if build_topic_docs:
-            console.print("[cyan]Building topic docs...[/cyan]")
+            console.print(
+                "[cyan]Optional overview docs (NOT used for retrieval)...[/cyan]"
+            )
             index = build_topic_documents(
                 big_chunks, tags, catalog, out_root / "topic_docs"
             )
             result["index"] = index
+
+        if rebuild_kb:
+            collection, coverage = _store_tagged_originals(
+                run=run,
+                big_chunks=big_chunks,
+                emb=emb,
+                tags=tags,
+                out_root=out_root,
+            )
+            write_kb_manifest(
+                settings.KB_TOPIC_MODELING,
+                chunk_count=len(big_chunks),
+                extra={"coverage": coverage},
+            )
+            result["coverage"] = coverage
+            result["knowledge_base"] = collection
 
         meta = finish_run(
             status="completed",
             stage="clustering",
             topics_found=len([t for t in catalog if t["topic_id"] != -1]),
             reused_embeddings=reuse_embeddings,
+            rebuilt_kb=rebuild_kb,
         )
         console.print(f"[green]Run metadata:[/green] {meta}")
         console.print(f"[cyan]Token usage:[/cyan] {run.usage.as_dict()}")
@@ -135,12 +222,22 @@ def run_pipeline_topic_modeling_rag(
     *,
     run_id: str | None = None,
     reuse_embeddings: bool = False,
+    build_topic_docs: bool = False,
 ) -> dict:
-    run = start_run("pipeline_topic_modeling_rag", run_id=run_id) if not run_id else load_run(run_id)
+    """
+    Topic pipeline (A+D style):
+      cluster → tag originals → store originals with topic_slug
+    Free-form topic-doc rewrite is optional and NOT indexed for retrieval.
+    """
+    run = (
+        start_run("pipeline_topic_modeling_rag", run_id=run_id)
+        if not run_id
+        else load_run(run_id)
+    )
     if run_id:
         run.pipeline = "pipeline_topic_modeling_rag"
     console.rule("[bold]pipeline_topic_modeling_rag[/bold]")
-    console.print(f"[bold cyan]run_id:[/bold cyan] {run.run_id}  ← timestamp id (see runs/latest.json)")
+    console.print(f"[bold cyan]run_id:[/bold cyan] {run.run_id}")
     out_root = run.artifacts_dir / "topic_modeling"
     ensure_dir(out_root)
 
@@ -163,86 +260,39 @@ def run_pipeline_topic_modeling_rag(
             out_path=out_root / "topic_tags.jsonl",
         )
 
-        console.print("[cyan]5. Iterative LLM topic document building...[/cyan]")
-        docs_dir = out_root / "topic_docs"
-        index = build_topic_documents(big_chunks, tags, catalog, docs_dir)
-
-        console.print("[cyan]6. Re-chunk + contextualize + embed topic docs...[/cyan]")
-        final_chunks: list[dict] = []
-        for slug, meta in index.items():
-            path = out_root / meta["path"]
-            text = path.read_text(encoding="utf-8")
-            records = [{"text": text, "source": f"{slug}.md", "page": 0}]
-            small = chunk_records(
-                records,
-                chunk_size=settings.SMALL_CHUNK_SIZE,
-                chunk_overlap=settings.SMALL_CHUNK_OVERLAP,
+        index = None
+        if build_topic_docs:
+            console.print(
+                "[cyan]Optional: LLM topic overviews (artifact only, not in KB)...[/cyan]"
             )
-            for sc in small:
-                sc["topic_slug"] = slug
-                sc["source_doc_slug"] = slug
-                sc["chunk_id"] = f"{slug}_{sc['chunk_id']}"
-                final_chunks.append(sc)
+            index = build_topic_documents(
+                big_chunks, tags, catalog, out_root / "topic_docs"
+            )
 
-        console.print(f"  {len(final_chunks)} small chunks from topic docs")
-        contextualizer = Contextualizer()
-        contexts = contextualizer.contextualize_many(
-            final_chunks, desc="Contextualizing topic chunks"
+        collection, coverage = _store_tagged_originals(
+            run=run,
+            big_chunks=big_chunks,
+            emb=emb,
+            tags=tags,
+            out_root=out_root,
         )
-
-        enriched: list[dict] = []
-        for chunk, context in zip(final_chunks, contexts):
-            embed_text = f"{context}\n\n{chunk['content']}"
-            enriched.append({**chunk, "context": context, "embed_text": embed_text})
-
-        embedder = Embedder()
-        embeddings = embedder.embed([c["embed_text"] for c in enriched])
-        kb_base = settings.KB_TOPIC_MODELING
-        console.print(f"[cyan]Storing knowledge base:[/cyan] {run.kb_name(kb_base)}")
-        store, collection = kb_store(kb_base)
-        store.add(
-            collection,
-            ids=[c["chunk_id"] for c in enriched],
-            documents=[c["content"] for c in enriched],
-            embeddings=embeddings,
-            metadatas=[
-                {
-                    "chunk_id": c["chunk_id"],
-                    "topic_slug": c["topic_slug"],
-                    "source_doc_slug": c["source_doc_slug"],
-                    "source": c["source"],
-                    "page": int(c["page"]),
-                    "knowledge_base": collection,
-                    "run_id": run.run_id,
-                }
-                for c in enriched
-            ],
-            reset=True,
-        )
-        write_jsonl(out_root / "final_chunks.jsonl", enriched)
-
-        total = len(big_chunks)
-        uncategorized = sum(1 for t in tags if t["topic_slug"] == "uncategorized")
-        covered = total - uncategorized
-        coverage = {
-            "total_chunks": total,
-            "uncategorized": uncategorized,
-            "covered": covered,
-            "coverage_pct": round((covered / total * 100) if total else 0.0, 2),
-        }
-        write_json(out_root / "coverage.json", coverage)
         manifest = write_kb_manifest(
-            kb_base, chunk_count=len(enriched), extra={"coverage": coverage}
+            settings.KB_TOPIC_MODELING,
+            chunk_count=len(big_chunks),
+            extra={"coverage": coverage},
         )
         meta_path = finish_run(
             status="completed",
             coverage=coverage,
             knowledge_base=collection,
             topics_found=len([t for t in catalog if t["topic_id"] != -1]),
+            index_mode="topic_tagged_originals",
+            mmr_enabled=settings.MMR_ENABLED,
         )
         console.print(
-            f"[green]Coverage:[/green] {coverage['coverage_pct']}% "
-            f"({covered}/{total}); outliers excluded: {uncategorized}"
+            f"[green]Tagged coverage:[/green] {coverage['coverage_pct']}% "
+            f"({coverage['covered']}/{coverage['total_chunks']}); "
+            f"uncategorized still indexed: {coverage['uncategorized']}"
         )
         console.print(f"[green]Knowledge base:[/green] {collection}")
         console.print(f"[green]Manifest:[/green] {manifest}")

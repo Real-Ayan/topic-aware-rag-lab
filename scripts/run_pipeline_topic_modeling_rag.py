@@ -21,10 +21,16 @@ def main() -> None:
         action="store_true",
         help="Skip embedding; load embeddings.npy from the run's topic_modeling artifacts",
     )
+    parser.add_argument(
+        "--build-topic-docs",
+        action="store_true",
+        help="Also write optional LLM overview docs (not indexed for retrieval)",
+    )
     args = parser.parse_args()
     run_pipeline_topic_modeling_rag(
         run_id=args.run_id,
         reuse_embeddings=args.reuse_embeddings,
+        build_topic_docs=args.build_topic_docs,
     )
 
 

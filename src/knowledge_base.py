@@ -9,6 +9,7 @@ from src.chroma_store import ChromaStore
 from src.config import settings
 from src.embedder import Embedder
 from src.io_utils import answer_with_context, ensure_dir, read_json, write_json
+from src.mmr import mmr_select
 from src.run_context import RUNS_DIR, get_run
 
 
@@ -20,7 +21,10 @@ def _kb_meta(base_name: str) -> dict:
         },
         settings.KB_TOPIC_MODELING: {
             "pipeline": "pipeline_topic_modeling_rag",
-            "description": "Topic modeling RAG: cluster → LLM topic docs → chunks.",
+            "description": (
+                "Topic-tagged original chunks (topics filter/route; no rewrite KB). "
+                "Retrieval uses MMR for diversity."
+            ),
         },
     }
     info = pipelines.get(
@@ -143,11 +147,82 @@ def write_kb_manifest(
     return path
 
 
-def retrieve(kb_name: str, query: str, top_k: int | None = None) -> list[dict]:
+def _route_by_topic(candidates: list[dict], *, peek: int = 5) -> list[dict]:
+    """
+    Soft topic routing: look at early hits, pick majority topic_slug
+    (ignoring uncategorized when possible), keep same-topic candidates
+    if enough remain; otherwise keep all.
+    """
+    if not candidates:
+        return candidates
+    peek_hits = candidates[: min(peek, len(candidates))]
+    counts: dict[str, int] = {}
+    for h in peek_hits:
+        slug = (h.get("metadata") or {}).get("topic_slug")
+        if not slug or slug == "uncategorized":
+            continue
+        counts[slug] = counts.get(slug, 0) + 1
+    if not counts:
+        return candidates
+    winner = max(counts, key=counts.get)
+    filtered = [
+        h for h in candidates if (h.get("metadata") or {}).get("topic_slug") == winner
+    ]
+    # Need at least 2 same-topic hits or routing is pointless / harmful
+    if len(filtered) >= 2:
+        return filtered
+    return candidates
+
+
+def retrieve(
+    kb_name: str,
+    query: str,
+    top_k: int | None = None,
+    *,
+    use_mmr: bool | None = None,
+    topic_route: bool | None = None,
+) -> list[dict]:
+    """
+    Retrieve with optional topic soft-routing + MMR diversity.
+
+    Fetches RETRIEVE_CANDIDATES, optionally narrows by majority topic among
+    early hits, then applies MMR down to top_k.
+    """
+    k = top_k or settings.TOP_K
+    fetch_k = max(k, settings.RETRIEVE_CANDIDATES)
+    do_mmr = settings.MMR_ENABLED if use_mmr is None else use_mmr
+    do_route = settings.TOPIC_ROUTE_ENABLED if topic_route is None else topic_route
+
     store, collection = kb_store(kb_name)
     embedder = Embedder()
-    embedding = embedder.embed([query])[0]
-    return store.search(collection, embedding, top_k=top_k or settings.TOP_K)
+    query_embedding = embedder.embed([query])[0]
+
+    # Only apply topic routing when this collection has topic tags
+    candidates = store.search(
+        collection,
+        query_embedding,
+        top_k=fetch_k,
+        include_embeddings=do_mmr,
+    )
+
+    has_topics = any((c.get("metadata") or {}).get("topic_slug") for c in candidates)
+    if do_route and has_topics:
+        candidates = _route_by_topic(candidates)
+
+    if do_mmr:
+        selected = mmr_select(
+            query_embedding,
+            candidates,
+            top_k=k,
+            lambda_mult=settings.MMR_LAMBDA,
+        )
+    else:
+        selected = candidates[:k]
+
+    # Drop embeddings from return payload (large / not needed by callers)
+    for item in selected:
+        item.pop("embedding", None)
+    return selected
 
 
 def ask(kb_name: str, question: str, top_k: int | None = None) -> dict:

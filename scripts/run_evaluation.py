@@ -15,9 +15,8 @@ from rich.console import Console
 from rich.progress import track
 
 from src.config import settings
-from src.embedder import Embedder
 from src.io_utils import answer_with_context, ensure_dir, read_json, write_json
-from src.knowledge_base import kb_store
+from src.knowledge_base import ask
 
 console = Console()
 
@@ -35,18 +34,13 @@ def _load_qa_pairs() -> list[dict]:
     return data
 
 
-def _run_pipeline(name: str, kb_name: str, qa_pairs: list[dict], embedder: Embedder):
+def _run_pipeline(name: str, kb_name: str, qa_pairs: list[dict]):
     answers: list[str] = []
     contexts: list[list[str]] = []
-    store, collection = kb_store(kb_name)
     for q in track(qa_pairs, description=f"Querying {name}"):
-        question = q["question"]
-        q_emb = embedder.embed([question])[0]
-        hits = store.search(collection, q_emb, settings.TOP_K)
-        ctx_texts = [h["content"] for h in hits]
-        answer = answer_with_context(question, ctx_texts)
-        answers.append(answer)
-        contexts.append(ctx_texts)
+        result = ask(kb_name, q["question"], top_k=settings.TOP_K)
+        answers.append(result["answer"])
+        contexts.append(result["contexts"])
     return answers, contexts
 
 
@@ -92,16 +86,13 @@ def main() -> None:
     run = load_run(args.run_id)
     run.pipeline = (run.pipeline or "") + "+evaluation"
     qa_pairs = _load_qa_pairs()
-    embedder = Embedder()
 
     kb_ctx = run.kb_name(settings.KB_CONTEXTUAL)
     kb_topic = run.kb_name(settings.KB_TOPIC_MODELING)
 
-    answers_ctx, contexts_ctx = _run_pipeline(
-        "pipeline_contextual_rag", kb_ctx, qa_pairs, embedder
-    )
+    answers_ctx, contexts_ctx = _run_pipeline("pipeline_contextual_rag", kb_ctx, qa_pairs)
     answers_topic, contexts_topic = _run_pipeline(
-        "pipeline_topic_modeling_rag", kb_topic, qa_pairs, embedder
+        "pipeline_topic_modeling_rag", kb_topic, qa_pairs
     )
 
     console.print("[cyan]Scoring pipeline_contextual_rag with RAGAS...[/cyan]")

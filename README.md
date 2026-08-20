@@ -4,6 +4,8 @@ Standalone experiment lab comparing **pipeline_contextual_rag** vs **pipeline_to
 
 Each execution creates a **run** under `runs/{run_id}/` with its own artifacts, knowledge bases, and `run_metadata.json` (models + estimated token usage).
 
+Experiment findings: [`plan/Experiement/rag-experiment-findings.md`](plan/Experiement/rag-experiment-findings.md)
+
 ---
 
 ## Put your files here
@@ -68,9 +70,22 @@ uv run scripts/query_knowledge_base.py compare --run-id <RUN_ID> --question "...
 
 ---
 
-## Clustering — general ideas (not corpus-specific)
+## Dedup approach (A+D)
 
-Defaults follow common BERTopic practice (`hdbscan` + `eom`). Treat `.env` as knobs you change, then re-cluster with cached embeddings.
+- **D:** Topic pipeline indexes **original chunks** with `topic_slug` (no rewrite into Chroma).
+- **A:** Retrieval fetches extra candidates, soft-routes by majority topic (when tags exist), then **MMR** for diversity.
+
+```bash
+# Cheapest: re-index existing tags for run 20260820_172419
+uv run scripts/run_topic_clustering.py --run-id 20260820_172419 --rebuild-kb-only
+
+# Or full new topic run
+uv run scripts/run_pipeline_topic_modeling_rag.py
+```
+
+---
+
+## Clustering — general ideas (not corpus-specific)
 
 | Goal | What to try |
 |---|---|

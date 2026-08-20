@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     KB_TOPIC_MODELING: str = "kb_topic_modeling_rag"
 
     TOP_K: int = 5
+    # Retrieve this many candidates before MMR / topic routing
+    RETRIEVE_CANDIDATES: int = 20
+    MMR_ENABLED: bool = True
+    MMR_LAMBDA: float = 0.7  # 1=relevance only, 0=diversity only
+    TOPIC_ROUTE_ENABLED: bool = True  # prefer majority topic among early hits
     TOPIC_DOC_BATCH_SIZE: int = 5
 
     DATA_RAW_DIR: str = str(ROOT_DIR / "data" / "raw")
