@@ -1,0 +1,26 @@
+[project]
+name = "topic-aware-rag-lab"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bertopic>=0.17.4",
+    "chromadb>=1.5.9",
+    "datasets>=2.19.1",
+    "hdbscan>=0.8.44",
+    "langchain>=0.3.30",
+    "langchain-community>=0.3.27",
+    "langchain-openai>=0.3.35",
+    "openai>=1.109.1",
+    "pydantic-settings>=2.15.0",
+    "pymupdf>=1.28.2",
+    "python-dotenv>=1.2.3",
+    "ragas>=0.3.2",
+    "rich>=13.9.4",
+    "torch>=2.13.0",
+    "umap-learn>=0.5.12",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cpu"

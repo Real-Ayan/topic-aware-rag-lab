@@ -1,0 +1,14 @@
+openai
+chromadb
+bertopic
+umap-learn
+hdbscan
+langchain
+langchain-openai
+langchain-community
+pymupdf
+ragas
+datasets
+python-dotenv
+pydantic-settings
+rich
