@@ -1,99 +1,209 @@
 # topic-aware-rag-lab
 
-Standalone experiment lab comparing **pipeline_contextual_rag** vs **pipeline_topic_modeling_rag**.
+Experiment lab comparing **contextual RAG** vs **topic-tagged RAG** on company docs (PDF / DOCX / TXT).
 
-Each execution creates a **run** under `runs/{run_id}/` with its own artifacts, knowledge bases, and `run_metadata.json` (models + estimated token usage).
+Each pipeline run creates a timestamped folder under `runs/` with its own artifacts, Chroma knowledge base, and `run_metadata.json` (models + token usage).
 
-Experiment findings: [`plan/Experiement/rag-experiment-findings.md`](plan/Experiement/rag-experiment-findings.md)
-
----
-
-## Put your files here
-
-```
-data/raw/   # recursive: all nested .pdf / .docx / .txt
-```
+Findings write-up: [`plan/Experiement/rag-experiment-findings.md`](plan/Experiement/rag-experiment-findings.md)
 
 ---
 
-## Setup
+## 1. Setup
+
+Requires Python ≥ 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv venv && source .venv/bin/activate
+
+# CPU Torch first (avoids huge CUDA wheels; embeddings are OpenAI-only)
 uv add torch --index https://download.pytorch.org/whl/cpu
 uv add -r requirements.txt
-cp .env.example .env   # set OPENAI_API_KEY
+
+cp .env.example .env
+# edit .env → set OPENAI_API_KEY=sk-...
 ```
+
+Useful `.env` knobs: `LLM_MODEL`, `EMBEDDING_MODEL`, `TOP_K`, `MMR_*`, clustering settings (see §7).
 
 ---
 
-## Run order
+## 2. Put your documents here
+
+```text
+data/raw/
+```
+
+- Loads **recursively** (nested folders OK)
+- Supported: `.pdf`, `.docx`, `.txt`, `.md`
+- Skips `README.md` / `.gitkeep`
+
+---
+
+## 3. Build the two knowledge bases
+
+Run each pipeline once (each creates its **own** `run_id`):
 
 ```bash
+# A) Contextual RAG — chunk + LLM context prefix + embed
 uv run scripts/run_pipeline_contextual_rag.py
-uv run scripts/run_pipeline_topic_modeling_rag.py
 
-# Re-cluster without re-embedding (after changing cluster settings in .env)
-uv run scripts/run_topic_clustering.py --run-id <RUN_ID> --reuse-embeddings
-
-uv run scripts/generate_testset.py
-uv run scripts/run_evaluation.py --run-id <RUN_ID>
-```
-
----
-
-## Run IDs, metadata & tokens
-
-Run ids are **local timestamps**: `YYYYMMDD_HHMMSS` (e.g. `20260820_171521`). Newest sorts last alphabetically / first in the list.
-
-```bash
-uv run scripts/list_runs.py   # marks ← latest
-cat runs/latest.json          # pointer to last run
-cat runs/index.json           # all runs
-```
-
-Each run also has `runs/{run_id}/run_metadata.json` with `model_config` + API `token_usage`.
-
----
-
-## Knowledge bases
-
-| Base name | On disk |
-|---|---|
-| `kb_contextual_rag` | `runs/{run_id}/knowledge_bases/kb_contextual_rag__{run_id}/` |
-| `kb_topic_modeling_rag` | `runs/{run_id}/knowledge_bases/kb_topic_modeling_rag__{run_id}/` |
-
-```bash
-uv run scripts/query_knowledge_base.py list
-uv run scripts/query_knowledge_base.py compare --run-id <RUN_ID> --question "..."
-```
-
----
-
-## Dedup approach (A+D)
-
-- **D:** Topic pipeline indexes **original chunks** with `topic_slug` (no rewrite into Chroma).
-- **A:** Retrieval fetches extra candidates, soft-routes by majority topic (when tags exist), then **MMR** for diversity.
-
-```bash
-# Cheapest: re-index existing tags for run 20260820_172419
-uv run scripts/run_topic_clustering.py --run-id 20260820_172419 --rebuild-kb-only
-
-# Or full new topic run
+# B) Topic RAG — cluster/tag + index ORIGINAL chunks (no rewrite KB)
 uv run scripts/run_pipeline_topic_modeling_rag.py
 ```
 
+Note the printed `run_id` (also in `runs/latest.json`). Example:
+
+| Pipeline | Example run id |
+|---|---|
+| Contextual | `20260820_172037` |
+| Topic | `20260820_172419` |
+
+List runs anytime:
+
+```bash
+uv run scripts/list_runs.py
+```
+
 ---
 
-## Clustering — general ideas (not corpus-specific)
+## 4. Ask a question (main tool)
 
-| Goal | What to try |
+Compare **both** KBs with one question. Pass the run id for each:
+
+```bash
+uv run scripts/ask.py \
+  --contextual-run 20260820_172037 \
+  --topic-run 20260820_172419 \
+  "What is RPI Sentinel?"
+```
+
+Interactive (prompts for the question):
+
+```bash
+uv run scripts/ask.py \
+  --contextual-run 20260820_172037 \
+  --topic-run 20260820_172419
+```
+
+### Inspect retrieved chunks (spot bad context)
+
+**Retrieve only** — no LLM answer cost:
+
+```bash
+uv run scripts/ask.py \
+  --contextual-run 20260820_172037 \
+  --topic-run 20260820_172419 \
+  --inspect-only \
+  --top-k 8 \
+  "What is RPI Sentinel?"
+```
+
+Shows per hit: `distance`, `topic_slug`, `source`, `chunk_id`, text preview.
+
+**Answer + chunk dump:**
+
+```bash
+uv run scripts/ask.py \
+  --contextual-run 20260820_172037 \
+  --topic-run 20260820_172419 \
+  --show-contexts \
+  "What is PetHero?"
+```
+
+**JSON output** (for scripts):
+
+```bash
+uv run scripts/ask.py \
+  --contextual-run 20260820_172037 \
+  --topic-run 20260820_172419 \
+  --json \
+  "What cloud services does RPI offer?"
+```
+
+What to check in hits:
+- Is `source` the right product file?
+- Are #2–#5 near-duplicates / sibling products?
+- Is `distance` much worse after hit #1?
+
+---
+
+## 5. What each pipeline stores
+
+| Pipeline | Knowledge base path | Contents |
+|---|---|---|
+| Contextual | `runs/{id}/knowledge_bases/kb_contextual_rag__{id}/` | Chunks + LLM context prefixes |
+| Topic | `runs/{id}/knowledge_bases/kb_topic_modeling_rag__{id}/` | **Original** chunks tagged with `topic_slug` |
+
+Topic approach (A+D):
+- **D** — topics tag originals (not free-form rewritten mega-docs)
+- **A** — retrieval uses candidate fetch + soft topic route + **MMR** diversity
+
+Optional human-readable topic overviews (not used for retrieval):
+
+```bash
+uv run scripts/run_pipeline_topic_modeling_rag.py --build-topic-docs
+```
+
+---
+
+## 6. Rebuild / re-cluster topic KB
+
+Cheapest: re-index from existing tags + embeddings (no re-embed, no re-cluster):
+
+```bash
+uv run scripts/run_topic_clustering.py \
+  --run-id 20260820_172419 \
+  --rebuild-kb-only
+```
+
+Re-cluster with cached embeddings (after changing `.env` cluster knobs):
+
+```bash
+uv run scripts/run_topic_clustering.py \
+  --run-id 20260820_172419 \
+  --reuse-embeddings \
+  --rebuild-kb
+```
+
+---
+
+## 7. Clustering knobs (general)
+
+Edit `.env`, then re-cluster with `--reuse-embeddings`.
+
+| Goal | Try |
 |---|---|
-| Fewer / broader topics | Raise `HDBSCAN_MIN_CLUSTER_SIZE`; keep `HDBSCAN_SELECTION_METHOD=eom` |
-| More / finer topics | Lower `HDBSCAN_MIN_CLUSTER_SIZE`; try `HDBSCAN_SELECTION_METHOD=leaf` |
-| Fixed topic count | `CLUSTER_METHOD=kmeans` and set `N_TOPICS` to your target |
-| Stable geometry | Adjust `UMAP_N_NEIGHBORS` / `UMAP_N_COMPONENTS` (larger neighbors → smoother) |
-| Better topic names | Raise `TOPIC_LABEL_SAMPLES` (LLM sees more excerpts; no c-TF-IDF labels) |
-| Cheap iteration | Embed once → change knobs → `run_topic_clustering.py --reuse-embeddings` |
+| Fewer / broader topics | Raise `HDBSCAN_MIN_CLUSTER_SIZE`; `HDBSCAN_SELECTION_METHOD=eom` |
+| More / finer topics | Lower `HDBSCAN_MIN_CLUSTER_SIZE`; try `leaf` |
+| Fixed topic count | `CLUSTER_METHOD=kmeans` + `N_TOPICS=...` |
+| Better topic names | Raise `TOPIC_LABEL_SAMPLES` |
 
-Topic labels always come from **random chunk samples → LLM**, not keyword lists.
+---
+
+## 8. Scripts reference
+
+| Script | Purpose |
+|---|---|
+| `scripts/run_pipeline_contextual_rag.py` | Build contextual KB |
+| `scripts/run_pipeline_topic_modeling_rag.py` | Build topic-tagged KB |
+| `scripts/run_topic_clustering.py` | Re-cluster / rebuild topic KB |
+| `scripts/ask.py` | Ask both KBs / inspect contexts |
+| `scripts/list_runs.py` | List runs (marks ← latest) |
+| `scripts/query_knowledge_base.py` | List/query KBs |
+| `scripts/generate_testset.py` | Candidate Q&A (then human-review → `qa_pairs.json`) |
+| `scripts/run_evaluation.py --run-id ...` | RAGAS eval (needs `qa_pairs.json`) |
+
+---
+
+## 9. Layout
+
+```text
+topic-aware-rag-lab/
+├── data/raw/                 ← drop docs here
+├── runs/{run_id}/            ← artifacts + knowledge_bases + run_metadata.json
+├── scripts/                  ← CLI entrypoints
+├── src/                      ← pipelines + retrieve/ask
+├── plan/Experiement/         ← design + findings
+├── .env                      ← secrets (gitignored)
+└── README.md                 ← this guide
+```
